@@ -120,6 +120,7 @@ class MdkVideoPlayer extends VideoPlayerPlatform {
       });
       player.setProperty('avio.headers', headers);
     }
+    player.setProperty('avio.protocol_whitelist', 'file,http,https,tcp,tls,crypto');
     final sc = _initEvents(player);
     player.media = uri!;
     player.prepare(); // required!
