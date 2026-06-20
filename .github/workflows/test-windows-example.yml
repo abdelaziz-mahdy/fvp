@@ -1,0 +1,31 @@
+name: Test Windows example build (mdk-sdk symlink fix)
+
+# Validates the cmake/deps.cmake fix: building the example app on Windows
+# creates the Flutter plugin symlink (.plugin_symlinks/fvp) and triggers
+# fvp_setup_deps -> mdk-sdk extraction, which newer CMake rejected with
+# "Cannot extract through symlink". This must now succeed.
+
+on:
+  push:
+    branches: [fix/windows-cmake-symlink-extract]
+  workflow_dispatch:
+
+jobs:
+  windows-example:
+    name: Build example (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: git config --system core.longpaths true
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Toolchain info
+        run: |
+          flutter --version
+          cmake --version
+      - name: Build example (release)
+        working-directory: example
+        run: |
+          flutter pub get
+          flutter build windows --release
