@@ -7,19 +7,25 @@
 // Cross-context RGBA_1010102 sampling probe.
 //
 // Some drivers (e.g. PowerVR BXE on Realtek TV SoCs, wang-bin/fvp#374) accept
-// a 10-bit EGLConfig, allocate and render into RGBA_1010102 window buffers
-// without any EGL/GL error — but cannot sample those buffers consistently
-// from a *different* GL context (IMGSRV "IsTextureConsistent" failures), which
+// a 10-bit EGLConfig, allocate and render into RGBA_1010102 buffers without
+// any EGL/GL error — but cannot sample those buffers consistently from a
+// *different* GL context (IMGSRV "IsTextureConsistent" failures), which
 // corrupts every frame the Flutter engine consumes. Since no error surfaces
 // through the API, the only reliable detection is to reproduce the handoff:
 //
-//   1. render a known pattern into an RGBA_1010102 ImageReader surface
-//      (same gralloc usage bits as the real video path) from one EGL context
-//   2. import the produced AHardwareBuffer as an EGLImage in a second,
-//      unshared context (what the Flutter engine does)
-//   3. sample it and read back; mismatch => the 10-bit path is broken
+//   1. create an AImageReader with AIMAGE_FORMAT_PRIVATE (producer-defined
+//      format) and render a known pattern into its window from an EGL window
+//      surface using a 10-bit config — the driver then allocates its native
+//      (vendor tiled/compressed) RGBA_1010102 window buffers, exactly like
+//      the real video path. A directly allocated AHardwareBuffer is NOT
+//      enough: it skips the EGL window allocation path and its vendor
+//      compression, and round-trips fine on drivers that corrupt real
+//      window buffers.
+//   2. acquire the produced buffer and import it as an EGLImage in a second,
+//      unshared context (what the Flutter engine does), sample as an
+//      external texture and read back
 //
-// The result decides whether to force GLRenderAPI.depth = 8 before
+// A mismatch decides to force GLRenderAPI.depth = 8 before
 // updateNativeSurface(). Any probe-infrastructure failure returns "ok" so
 // healthy devices are never punished. Probed once per process.
 //
@@ -43,9 +49,9 @@ using std::endl;
 
 namespace {
 
-// libmediandk symbols resolved at runtime: AImageReader_newWithUsage and
-// AImage_getHardwareBuffer are API 26+, while the plugin may load on older
-// devices where direct linking would abort the load.
+// libmediandk symbols are resolved at runtime: AImageReader_newWithUsage and
+// AImage_getHardwareBuffer are API 26+, and direct linking would break plugin
+// load on older devices (which won't see 1010102 anyway).
 struct AImageReader;
 struct AImage;
 typedef int (*AImageReader_newWithUsage_t)(int32_t, int32_t, int32_t, uint64_t, int32_t, AImageReader**);
@@ -55,31 +61,35 @@ typedef void (*AImageReader_delete_t)(AImageReader*);
 typedef int (*AImage_getHardwareBuffer_t)(const AImage*, AHardwareBuffer**);
 typedef void (*AImage_delete_t)(AImage*);
 
-constexpr int32_t kFormatRgba1010102 = 0x2b; // AIMAGE_FORMAT_RGBA_1010102, API 26
-constexpr uint64_t kUsage =
-    AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE | AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT;
+constexpr int32_t kFormatPrivate = 0x22; // AIMAGE_FORMAT_PRIVATE: producer-defined
+
 constexpr int kSrcSize = 512; // large enough for vendor tiled/compressed layouts
-constexpr int kDstSize = 64;
+constexpr int kBlock = 8;     // 8 px * 4 Bpp = 32 bytes: the observed corruption burst size
+constexpr int kBlocks = kSrcSize / kBlock; // 64x64 blocks == dst pixels
+constexpr int kDstSize = kBlocks;
 
-// Quadrant colors (RGB 0..255). Distinct enough that any mis-decode fails.
-constexpr uint8_t kColors[4][3] = {
-    {255, 0, 0}, {0, 255, 0}, {0, 0, 255}, {255, 255, 255}};
+// Vendor framebuffer compression decodes FLAT content correctly even on
+// broken drivers (the real corruption spares flat areas and hits detail).
+// So the pattern must be high-frequency:每 8px block gets a pseudo-random
+// color from a hash, quantized to multiples of 85 for lossless 10->8 bit
+// round-trips.
+void blockColor(int bx, int by, uint8_t* rgb) {
+  const uint32_t v = (uint32_t)(bx * 73856093u) ^ (uint32_t)(by * 19349663u) ^ 0x9E3779B9u;
+  rgb[0] = (uint8_t)(((v >> 0) & 3) * 85);
+  rgb[1] = (uint8_t)(((v >> 8) & 3) * 85);
+  rgb[2] = (uint8_t)(((v >> 16) & 3) * 85);
+}
 
-bool closeToAny(const uint8_t* px) {
-  for (const auto& c : kColors) {
-    if (abs(int(px[0]) - c[0]) <= 24 && abs(int(px[1]) - c[1]) <= 24 &&
-        abs(int(px[2]) - c[2]) <= 24) {
-      return true;
-    }
-  }
-  return false;
+bool matches(const uint8_t* px, const uint8_t* rgb) {
+  return abs(int(px[0]) - rgb[0]) <= 24 && abs(int(px[1]) - rgb[1]) <= 24 &&
+         abs(int(px[2]) - rgb[2]) <= 24;
 }
 
 struct ProbeCleanup {
   void* ndk = nullptr;
   EGLDisplay dpy = EGL_NO_DISPLAY;
   EGLSurface winSurf = EGL_NO_SURFACE;
-  EGLSurface pbuf = EGL_NO_SURFACE;
+  EGLSurface pbufB = EGL_NO_SURFACE;
   EGLContext ctxA = EGL_NO_CONTEXT;
   EGLContext ctxB = EGL_NO_CONTEXT;
   EGLImageKHR image = EGL_NO_IMAGE_KHR;
@@ -111,7 +121,7 @@ struct ProbeCleanup {
       }
       if (image != EGL_NO_IMAGE_KHR && destroyImage) destroyImage(dpy, image);
       if (winSurf != EGL_NO_SURFACE) eglDestroySurface(dpy, winSurf);
-      if (pbuf != EGL_NO_SURFACE) eglDestroySurface(dpy, pbuf);
+      if (pbufB != EGL_NO_SURFACE) eglDestroySurface(dpy, pbufB);
       if (ctxA != EGL_NO_CONTEXT) eglDestroyContext(dpy, ctxA);
       if (ctxB != EGL_NO_CONTEXT) eglDestroyContext(dpy, ctxB);
     }
@@ -123,13 +133,13 @@ struct ProbeCleanup {
 };
 
 // true = 10-bit path verified broken. Everything else (including probe
-// infrastructure failures) = false.
+// infrastructure failures, each logged with its step) = false.
 bool probeShowsBroken() {
   void* ndk = dlopen("libmediandk.so", RTLD_NOW | RTLD_LOCAL);
-  if (!ndk) return false;
-  ProbeCleanup c;
-  c.ndk = ndk;
-  c.saveCurrent();
+  if (!ndk) {
+    clog << "rgb10a2 probe skip: no libmediandk" << endl;
+    return false;
+  }
   auto newWithUsage = (AImageReader_newWithUsage_t)dlsym(ndk, "AImageReader_newWithUsage");
   auto getWindow = (AImageReader_getWindow_t)dlsym(ndk, "AImageReader_getWindow");
   auto acquireNext = (AImageReader_acquireNextImage_t)dlsym(ndk, "AImageReader_acquireNextImage");
@@ -137,9 +147,10 @@ bool probeShowsBroken() {
   auto getHwBuffer = (AImage_getHardwareBuffer_t)dlsym(ndk, "AImage_getHardwareBuffer");
   auto imageDelete = (AImage_delete_t)dlsym(ndk, "AImage_delete");
   if (!newWithUsage || !getWindow || !acquireNext || !readerDelete || !getHwBuffer || !imageDelete) {
-    return false; // pre-26 device: can't probe (and 1010102 unlikely anyway)
+    clog << "rgb10a2 probe skip: mediandk symbols missing (pre-26?)" << endl;
+    dlclose(ndk);
+    return false;
   }
-
   auto getNativeClientBuffer =
       (PFNEGLGETNATIVECLIENTBUFFERANDROIDPROC)eglGetProcAddress("eglGetNativeClientBufferANDROID");
   auto createImage = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
@@ -147,53 +158,86 @@ bool probeShowsBroken() {
   auto imageTargetTexture =
       (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
   if (!getNativeClientBuffer || !createImage || !destroyImage || !imageTargetTexture) {
+    clog << "rgb10a2 probe skip: EGL extension functions missing" << endl;
     return false;
   }
 
+  ProbeCleanup c;
+  c.ndk = ndk;
+  c.saveCurrent();
+  c.destroyImage = destroyImage;
   c.readerDelete = readerDelete;
   c.imageDelete = imageDelete;
-  c.destroyImage = destroyImage;
 
   c.dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
   EGLint maj, min;
   if (c.dpy == EGL_NO_DISPLAY || !eglInitialize(c.dpy, &maj, &min)) {
     c.dpy = EGL_NO_DISPLAY;
+    clog << "rgb10a2 probe skip: no EGL display" << endl;
     return false;
   }
 
-  // 10-bit window config — the one MDK would select. None => nothing to probe.
+  // Only meaningful when a 10-bit config exists for MDK to pick.
   const EGLint attrs10[] = {EGL_RED_SIZE, 10, EGL_GREEN_SIZE, 10, EGL_BLUE_SIZE, 10,
                             EGL_ALPHA_SIZE, 2, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
                             EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_NONE};
   EGLConfig cfg10;
   EGLint n = 0;
-  if (!eglChooseConfig(c.dpy, attrs10, &cfg10, 1, &n) || n < 1) return false;
+  if (!eglChooseConfig(c.dpy, attrs10, &cfg10, 1, &n) || n < 1) {
+    clog << "rgb10a2 probe skip: no 10-bit EGLConfig" << endl;
+    return false;
+  }
 
-  if (newWithUsage(kSrcSize, kSrcSize, kFormatRgba1010102, kUsage, 2, &c.reader) != 0 || !c.reader) {
+  // BufferQueue consumer with a producer-defined format: the EGL window
+  // surface below (10-bit config) makes the driver allocate its native
+  // compressed RGBA_1010102 window buffers — the exact real-path allocation.
+  const uint64_t usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
+  const int rrc = newWithUsage(kSrcSize, kSrcSize, kFormatPrivate, usage, 2, &c.reader);
+  if (rrc != 0 || !c.reader) {
+    clog << "rgb10a2 probe skip: AImageReader(PRIVATE) failed: " << rrc << endl;
     return false;
   }
   ANativeWindow* window = nullptr; // owned by the reader
-  if (getWindow(c.reader, &window) != 0 || !window) return false;
+  if (getWindow(c.reader, &window) != 0 || !window) {
+    clog << "rgb10a2 probe skip: no reader window" << endl;
+    return false;
+  }
 
   const EGLint ctxAttrs[] = {EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE};
-  c.ctxA = eglCreateContext(c.dpy, cfg10, EGL_NO_CONTEXT, ctxAttrs);
-  if (c.ctxA == EGL_NO_CONTEXT) return false;
-  c.winSurf = eglCreateWindowSurface(c.dpy, cfg10, window, nullptr);
-  if (c.winSurf == EGL_NO_SURFACE) return false;
-  if (!eglMakeCurrent(c.dpy, c.winSurf, c.winSurf, c.ctxA)) return false;
+  const EGLint pbAttrs[] = {EGL_WIDTH, kDstSize, EGL_HEIGHT, kDstSize, EGL_NONE};
 
-  // Producer: four solid quadrants.
+  // --- Context A (producer): 10-bit window surface, like MDK's renderer. ---
+  c.ctxA = eglCreateContext(c.dpy, cfg10, EGL_NO_CONTEXT, ctxAttrs);
+  if (c.ctxA == EGL_NO_CONTEXT) {
+    clog << "rgb10a2 probe skip: ctxA create failed" << endl;
+    return false;
+  }
+  c.winSurf = eglCreateWindowSurface(c.dpy, cfg10, window, nullptr);
+  if (c.winSurf == EGL_NO_SURFACE) {
+    clog << "rgb10a2 probe skip: window surface failed: 0x" << std::hex << eglGetError()
+         << std::dec << endl;
+    return false;
+  }
+  if (!eglMakeCurrent(c.dpy, c.winSurf, c.winSurf, c.ctxA)) {
+    clog << "rgb10a2 probe skip: makeCurrent A failed" << endl;
+    return false;
+  }
   glEnable(GL_SCISSOR_TEST);
-  const int h = kSrcSize / 2;
-  const int quads[4][2] = {{0, 0}, {h, 0}, {0, h}, {h, h}};
-  for (int i = 0; i < 4; i++) {
-    glScissor(quads[i][0], quads[i][1], h, h);
-    glClearColor(kColors[i][0] / 255.f, kColors[i][1] / 255.f, kColors[i][2] / 255.f, 1.f);
-    glClear(GL_COLOR_BUFFER_BIT);
+  for (int by = 0; by < kBlocks; by++) {
+    for (int bx = 0; bx < kBlocks; bx++) {
+      uint8_t rgb[3];
+      blockColor(bx, by, rgb);
+      glScissor(bx * kBlock, by * kBlock, kBlock, kBlock);
+      glClearColor(rgb[0] / 255.f, rgb[1] / 255.f, rgb[2] / 255.f, 1.f);
+      glClear(GL_COLOR_BUFFER_BIT);
+    }
   }
   glDisable(GL_SCISSOR_TEST);
   glFinish();
-  if (!eglSwapBuffers(c.dpy, c.winSurf)) return false;
+  if (!eglSwapBuffers(c.dpy, c.winSurf)) {
+    clog << "rgb10a2 probe skip: swapBuffers failed" << endl;
+    return false;
+  }
   eglMakeCurrent(c.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 
   // The queued buffer lands in the reader asynchronously.
@@ -201,27 +245,52 @@ bool probeShowsBroken() {
     if (acquireNext(c.reader, &c.img) != 0) c.img = nullptr;
     if (!c.img) usleep(2000);
   }
-  if (!c.img) return false;
+  if (!c.img) {
+    clog << "rgb10a2 probe skip: no image acquired" << endl;
+    return false;
+  }
   AHardwareBuffer* ahb = nullptr; // owned by the AImage
-  if (getHwBuffer(c.img, &ahb) != 0 || !ahb) return false;
+  if (getHwBuffer(c.img, &ahb) != 0 || !ahb) {
+    clog << "rgb10a2 probe skip: no AHardwareBuffer" << endl;
+    return false;
+  }
 
-  // Consumer: separate (unshared) context, like the Flutter engine's.
+  EGLClientBuffer clientBuf = getNativeClientBuffer(ahb);
+  if (!clientBuf) {
+    clog << "rgb10a2 probe skip: no client buffer" << endl;
+    return false;
+  }
+  c.image = createImage(c.dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, clientBuf, nullptr);
+  if (c.image == EGL_NO_IMAGE_KHR) {
+    clog << "rgb10a2 probe skip: eglCreateImageKHR failed: 0x" << std::hex << eglGetError()
+         << std::dec << endl;
+    return false;
+  }
+
   const EGLint attrs8[] = {EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8,
                            EGL_ALPHA_SIZE, 8, EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
                            EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_NONE};
   EGLConfig cfg8;
-  if (!eglChooseConfig(c.dpy, attrs8, &cfg8, 1, &n) || n < 1) return false;
-  c.ctxB = eglCreateContext(c.dpy, cfg8, EGL_NO_CONTEXT, ctxAttrs);
-  if (c.ctxB == EGL_NO_CONTEXT) return false;
-  const EGLint pbAttrs[] = {EGL_WIDTH, kDstSize, EGL_HEIGHT, kDstSize, EGL_NONE};
-  c.pbuf = eglCreatePbufferSurface(c.dpy, cfg8, pbAttrs);
-  if (c.pbuf == EGL_NO_SURFACE) return false;
-  if (!eglMakeCurrent(c.dpy, c.pbuf, c.pbuf, c.ctxB)) return false;
+  if (!eglChooseConfig(c.dpy, attrs8, &cfg8, 1, &n) || n < 1) {
+    clog << "rgb10a2 probe skip: no 8-bit pbuffer config" << endl;
+    return false;
+  }
 
-  EGLClientBuffer clientBuf = getNativeClientBuffer(ahb);
-  if (!clientBuf) return false;
-  c.image = createImage(c.dpy, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID, clientBuf, nullptr);
-  if (c.image == EGL_NO_IMAGE_KHR) return false;
+  // --- Context B (consumer): unshared, like the Flutter engine's. ---
+  c.ctxB = eglCreateContext(c.dpy, cfg8, EGL_NO_CONTEXT, ctxAttrs);
+  if (c.ctxB == EGL_NO_CONTEXT) {
+    clog << "rgb10a2 probe skip: ctxB create failed" << endl;
+    return false;
+  }
+  c.pbufB = eglCreatePbufferSurface(c.dpy, cfg8, pbAttrs);
+  if (c.pbufB == EGL_NO_SURFACE) {
+    clog << "rgb10a2 probe skip: pbufB failed" << endl;
+    return false;
+  }
+  if (!eglMakeCurrent(c.dpy, c.pbufB, c.pbufB, c.ctxB)) {
+    clog << "rgb10a2 probe skip: makeCurrent B failed" << endl;
+    return false;
+  }
 
   GLuint tex = 0;
   glGenTextures(1, &tex);
@@ -250,7 +319,10 @@ bool probeShowsBroken() {
   glLinkProgram(prog);
   GLint linked = 0;
   glGetProgramiv(prog, GL_LINK_STATUS, &linked);
-  if (!linked) return false;
+  if (!linked) {
+    clog << "rgb10a2 probe skip: shader link failed" << endl;
+    return false;
+  }
   glUseProgram(prog);
   glUniform1i(glGetUniformLocation(prog, "t"), 0);
   static const GLfloat verts[] = {-1, -1, 1, -1, -1, 1, 1, 1};
@@ -260,28 +332,38 @@ bool probeShowsBroken() {
   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
   glFinish();
 
-  // Quadrant centers of the destination. Y orientation may flip between the
-  // surfaces, so accept any assignment of the four expected colors — garbage
-  // from a mis-decoded buffer matches none of them.
-  const int pts[4][2] = {{kDstSize / 4, kDstSize / 4},
-                         {3 * kDstSize / 4, kDstSize / 4},
-                         {kDstSize / 4, 3 * kDstSize / 4},
-                         {3 * kDstSize / 4, 3 * kDstSize / 4}};
-  int bad = 0;
-  for (const auto& p : pts) {
-    uint8_t px[4] = {0, 0, 0, 0};
-    glReadPixels(p[0], p[1], 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-    if (!closeToAny(px)) bad++;
+  // Each dst pixel maps NEAREST onto exactly one 8px source block. Compare
+  // every pixel against the hash color for both Y orientations (the flip is
+  // driver-dependent); corruption from a mis-decoded compressed buffer
+  // matches neither. A small allowance covers stray filtering artifacts.
+  static uint8_t out[kDstSize * kDstSize * 4];
+  glReadPixels(0, 0, kDstSize, kDstSize, GL_RGBA, GL_UNSIGNED_BYTE, out);
+  const GLenum e = glGetError();
+  if (e != GL_NO_ERROR) {
+    clog << "rgb10a2 probe skip: GL error 0x" << std::hex << e << std::dec << endl;
+    return false;
   }
-  if (glGetError() != GL_NO_ERROR) return false;
-  clog << "rgb10a2 cross-context probe: " << bad << "/4 samples corrupt" << endl;
-  return bad > 0;
+  int badUp = 0, badDown = 0;
+  for (int y = 0; y < kDstSize; y++) {
+    for (int x = 0; x < kDstSize; x++) {
+      const uint8_t* px = &out[(y * kDstSize + x) * 4];
+      uint8_t up[3], down[3];
+      blockColor(x, y, up);
+      blockColor(x, kBlocks - 1 - y, down);
+      if (!matches(px, up)) badUp++;
+      if (!matches(px, down)) badDown++;
+    }
+  }
+  const int bad = badUp < badDown ? badUp : badDown;
+  clog << "rgb10a2 cross-context probe: " << bad << "/" << kDstSize * kDstSize
+       << " samples corrupt" << endl;
+  return bad > kDstSize; // > ~1.5% corrupt = broken
 }
 
 } // namespace
 
-// True when RGBA_1010102 window buffers survive cross-context sampling on
-// this driver (or when the probe cannot run). Probed once; magic-static
+// True when RGBA_1010102 buffers survive cross-context sampling on this
+// driver (or when the probe cannot run). Probed once; magic-static
 // initialization makes concurrent first calls safe.
 bool fvpRgb10a2CrossContextOk() {
   static const bool ok = [] {
