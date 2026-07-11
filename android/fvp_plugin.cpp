@@ -33,6 +33,11 @@ private:
 
 static unordered_map<int64_t, shared_ptr<TexturePlayer>> players;
 
+// rgb10a2_probe.cpp — false when this driver corrupts RGBA_1010102 window
+// buffers on cross-context sampling (fvp#374), in which case the GL render
+// target is forced to 8-bit before the surface is attached.
+bool fvpRgb10a2CrossContextOk();
+
 
 extern "C" {
 
@@ -85,6 +90,13 @@ Java_com_mediadevkit_fvp_FvpPlugin_nativeSetSurface(JNIEnv *env, jobject thiz, j
         // property takes effect. Tunneled output requires MediaCodec.
         player->setDecoders(mdk::MediaType::Video, {"AMediaCodec"});
     } else {
+        if (!fvpRgb10a2CrossContextOk()) {
+            // Driver renders 10-bit fine but the consumer context mis-reads
+            // the buffers (fvp#374): keep the SDR path on an 8-bit config.
+            mdk::GLRenderAPI ra{};
+            ra.depth = 8;
+            player->setRenderAPI(&ra, surface);
+        }
         player->updateNativeSurface(surface, w, h);
         player->vo_opaque = surface;
     }
