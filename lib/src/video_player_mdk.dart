@@ -363,14 +363,36 @@ class MdkVideoPlayerPlatform extends VideoPlayerPlatform {
       // force SurfaceFlinger into GPU composition at panel resolution.
       // In FVP_DIRECT_SURFACE mode there is no GL renderer: MediaCodec owns
       // the buffer geometry, so the clamp is skipped and the video scans out
-      // at native resolution.
-      final directSurface = () {
+      // at native resolution. HDR/10-bit content is forced back to the GL
+      // path: non-tunneled direct HDR output engages the display's HDR video
+      // plane, which wedges some TV SoCs (Realtek: decoder input stalls at
+      // 10/s with no output; verified on-device). The decision is made here —
+      // after prepare, when codec parameters are known — and carried to the
+      // surface attach via the platform view's creation params.
+      var directMode = () {
         try {
-          return Platform.environment['FVP_DIRECT_SURFACE'] == '1';
+          return Platform.environment['FVP_DIRECT_SURFACE'] ?? '0';
         } catch (_) {
-          return false;
+          return '0';
         }
       }();
+      if (directMode != '0') {
+        final vcs = player.mediaInfo.video;
+        if (vcs != null && vcs.isNotEmpty) {
+          final c = vcs[0].codec;
+          final hdr = c.doviProfile > 0 ||
+              (c.formatName?.contains('10') ?? false) ||
+              c.colorSpace == mdk.ColorSpace.bt2100PQ ||
+              c.colorSpace == mdk.ColorSpace.bt2100hlg;
+          if (hdr) {
+            directMode = '0';
+            _log.info('$hashCode player${player.nativeHandle} HDR/10-bit '
+                '(${c.formatName}, dovi=${c.doviProfile}, ${c.colorSpace}) '
+                '-> GL render path');
+          }
+        }
+      }
+      final directSurface = directMode != '0';
       var w = size.width.toInt();
       var h = size.height.toInt();
       if (directSurface) {
@@ -402,6 +424,7 @@ class MdkVideoPlayerPlatform extends VideoPlayerPlatform {
         'width': w,
         'height': h,
         'tunnel': _tunnel ?? false,
+        'direct': directMode,
       };
       _log.fine('$hashCode player${player.nativeHandle} platform view, '
           'video ${size.width.toInt()}x${size.height.toInt()}');

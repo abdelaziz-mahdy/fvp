@@ -6,6 +6,7 @@
 package com.mediadevkit.fvp;
 
 import android.content.Context;
+import android.system.Os;
 import android.util.Log;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
@@ -39,6 +40,11 @@ public class FvpVideoView implements PlatformView, SurfaceHolder.Callback {
     private final int videoWidth;
     private final int videoHeight;
     private final boolean tunnel;
+    // "0" = GL renderer, "1" = MediaCodec renders straight into the surface,
+    // "tunnel" = tunneled-playback experiment. Decided per video by the Dart
+    // side (HDR content is kept on GL) and exported as FVP_DIRECT_SURFACE
+    // right before the native attach, which reads it via getenv.
+    private final String directMode;
     private boolean released = false;
 
     FvpVideoView(Context context, int viewId, Map<String, Object> params) {
@@ -46,6 +52,8 @@ public class FvpVideoView implements PlatformView, SurfaceHolder.Callback {
         videoWidth = ((Number) params.get("width")).intValue();
         videoHeight = ((Number) params.get("height")).intValue();
         tunnel = Boolean.TRUE.equals(params.get("tunnel"));
+        Object direct = params.get("direct");
+        directMode = direct instanceof String ? (String) direct : "0";
         surfaceId = -1000L - viewId;
         surfaceView = new SurfaceView(context);
         if (videoWidth > 0 && videoHeight > 0) {
@@ -63,7 +71,12 @@ public class FvpVideoView implements PlatformView, SurfaceHolder.Callback {
 
     @Override
     public void surfaceCreated(SurfaceHolder holder) {
-        Log.i("FvpPlugin", "FvpVideoView surfaceCreated, video " + videoWidth + "x" + videoHeight + ", tunnel " + tunnel);
+        Log.i("FvpPlugin", "FvpVideoView surfaceCreated, video " + videoWidth + "x" + videoHeight + ", tunnel " + tunnel + ", direct " + directMode);
+        try {
+            Os.setenv("FVP_DIRECT_SURFACE", directMode, true);
+        } catch (Exception e) {
+            Log.w("FvpPlugin", "setenv FVP_DIRECT_SURFACE failed: " + e);
+        }
         FvpPlugin.nativeSetSurface(playerHandle, surfaceId, holder.getSurface(), videoWidth, videoHeight, tunnel);
         released = false;
     }
