@@ -12,6 +12,7 @@
 #include <mdk/MediaInfo.h>
 #include <mdk/RenderAPI.h>
 #include <cassert>
+#include <cstdlib>
 #include <unordered_map>
 #include <iostream>
 #include <sys/system_properties.h>
@@ -102,7 +103,7 @@ Java_com_mediadevkit_fvp_FvpPlugin_nativeSetSurface(JNIEnv *env, jobject thiz, j
             player->updateNativeSurface(nullptr);
             players.erase(it);
             if (s) {
-                env->DeleteGlobalRef(surface);
+                env->DeleteGlobalRef(s);
             }
         } else {
             clog << "player not found(already removed?) for textureId " + std::to_string(tex_id) + " surface " + std::to_string((intptr_t)surface) << endl;
@@ -120,6 +121,16 @@ Java_com_mediadevkit_fvp_FvpPlugin_nativeSetSurface(JNIEnv *env, jobject thiz, j
         // Re-set the decoder list to force a decoder re-open so the surface
         // property takes effect. Tunneled output requires MediaCodec.
         player->setDecoders(mdk::MediaType::Video, {"AMediaCodec"});
+    } else if (const char* ds = getenv("FVP_DIRECT_SURFACE"); ds && ds[0] == '1') {
+        // Bench experiment (PR #379 discussion): hand the platform view's
+        // surface to MediaCodec itself so decoded frames go straight into the
+        // SurfaceView buffer queue — no GL renderer, no EGLConfig, no GPU
+        // copy. image=0 disables the AImageReader (frame readback) path. The
+        // surface arrives after prepare(), so setDecoders forces a decoder
+        // re-open with the surface attached (same trick as the tunnel path).
+        player->surface = env->NewGlobalRef(surface);
+        player->setDecoders(mdk::MediaType::Video,
+            {"AMediaCodec:image=0:surface=" + std::to_string((intptr_t)player->surface)});
     } else {
         if (no10BitConformantWindowConfig()) {
             mdk::GLRenderAPI ra{};
