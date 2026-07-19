@@ -361,9 +361,21 @@ class MdkVideoPlayerPlatform extends VideoPlayerPlatform {
       // texture path: surface buffers are sized to the video, optionally
       // clamped. A clamp matters on weak GPUs — GL-rendering full 4K RGBA can
       // force SurfaceFlinger into GPU composition at panel resolution.
+      // In FVP_DIRECT_SURFACE mode there is no GL renderer: MediaCodec owns
+      // the buffer geometry, so the clamp is skipped and the video scans out
+      // at native resolution.
+      final directSurface = () {
+        try {
+          return Platform.environment['FVP_DIRECT_SURFACE'] == '1';
+        } catch (_) {
+          return false;
+        }
+      }();
       var w = size.width.toInt();
       var h = size.height.toInt();
-      if (_maxWidth != null && _maxHeight != null && (_fitMaxSize ?? true)) {
+      if (directSurface) {
+        // keep native w/h
+      } else if (_maxWidth != null && _maxHeight != null && (_fitMaxSize ?? true)) {
         final r = w / h;
         final fitW = (_maxHeight! * r).toInt();
         if (fitW <= _maxWidth!) {
