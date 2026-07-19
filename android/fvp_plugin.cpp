@@ -31,6 +31,7 @@ public:
     int height = 0;
     jobject surface = nullptr;
     void* vo_opaque = nullptr; // can change by TextureRegistry.SurfaceProducer.Callback
+    bool directSurface = false; // decoder renders straight to the surface (FVP_DIRECT_SURFACE)
 private:
 };
 
@@ -100,6 +101,16 @@ Java_com_mediadevkit_fvp_FvpPlugin_nativeSetSurface(JNIEnv *env, jobject thiz, j
         if (auto it = players.find(tex_id); it != players.end()) {
             auto& player = it->second;
             auto s = player->surface;
+            if (player->directSurface) {
+                // The codec is rendering into the surface that is being
+                // destroyed right now. Detach it BEFORE the surface dies: a
+                // MediaCodec left bound to a dead surface wedges (dequeue
+                // -10000, "can not return buffer to native window") and MDK
+                // marks the stream as decode-error — the next surface then
+                // never shows a frame. A surface-less re-open releases the
+                // codec cleanly; the re-attach re-opens with the new surface.
+                player->setDecoders(mdk::MediaType::Video, {"AMediaCodec"});
+            }
             player->updateNativeSurface(nullptr);
             players.erase(it);
             if (s) {
@@ -129,6 +140,7 @@ Java_com_mediadevkit_fvp_FvpPlugin_nativeSetSurface(JNIEnv *env, jobject thiz, j
         // surface arrives after prepare(), so setDecoders forces a decoder
         // re-open with the surface attached (same trick as the tunnel path).
         player->surface = env->NewGlobalRef(surface);
+        player->directSurface = true;
         player->setDecoders(mdk::MediaType::Video,
             {"AMediaCodec:image=0:surface=" + std::to_string((intptr_t)player->surface)});
     } else {
