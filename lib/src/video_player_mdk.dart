@@ -376,7 +376,11 @@ class MdkVideoPlayerPlatform extends VideoPlayerPlatform {
           return '0';
         }
       }();
-      if (directMode != '0') {
+      // FVP_DIRECT_SURFACE=force keeps HDR content on the direct path too —
+      // repro/testing escape hatch (mdk-sdk#361), not for normal use.
+      if (directMode == 'force') {
+        directMode = '1';
+      } else if (directMode != '0') {
         final vcs = player.mediaInfo.video;
         if (vcs != null && vcs.isNotEmpty) {
           final c = vcs[0].codec;
