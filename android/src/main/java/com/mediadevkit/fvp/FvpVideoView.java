@@ -6,11 +6,8 @@
 package com.mediadevkit.fvp;
 
 import android.content.Context;
-import android.graphics.Canvas;
-import android.graphics.Color;
 import android.system.Os;
 import android.util.Log;
-import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
@@ -105,42 +102,6 @@ public class FvpVideoView implements PlatformView, SurfaceHolder.Callback {
     public void dispose() {
         surfaceView.getHolder().removeCallback(this);
         release();
-        clearToBlack();
-    }
-
-    /**
-     * Overwrites the last decoded frame with black before the view goes away.
-     *
-     * A SurfaceView has its own compositor layer, and that layer is removed a
-     * frame or two after Flutter stops compositing the platform view — so when
-     * the route holding the video is popped, the last decoded frame briefly
-     * shows on top of the screen underneath. Whatever is still latched is what
-     * gets composited, so overwrite it. Only possible once the decoder has let
-     * go of the surface (see release()), which is why this runs after it.
-     */
-    private void clearToBlack() {
-        final SurfaceHolder holder = surfaceView.getHolder();
-        final Surface surface = holder.getSurface();
-        if (surface == null || !surface.isValid()) {
-            return;
-        }
-        Canvas canvas = null;
-        try {
-            canvas = holder.lockCanvas();
-            if (canvas != null) {
-                canvas.drawColor(Color.BLACK);
-            }
-        } catch (Exception e) {
-            Log.w("FvpPlugin", "clearToBlack lockCanvas failed: " + e);
-        } finally {
-            if (canvas != null) {
-                try {
-                    holder.unlockCanvasAndPost(canvas);
-                } catch (Exception e) {
-                    Log.w("FvpPlugin", "clearToBlack post failed: " + e);
-                }
-            }
-        }
     }
 
     private void release() {
