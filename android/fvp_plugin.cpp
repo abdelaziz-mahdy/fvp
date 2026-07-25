@@ -195,14 +195,11 @@ Java_com_mediadevkit_fvp_FvpPlugin_nativeSetSurfaceSize(JNIEnv *env, jobject thi
         return;
     }
     auto& player = it->second;
-    if (player->width == w && player->height == h) {
-        return;
-    }
     player->width = w;
     player->height = h;
     // In direct-surface mode the decoder owns the buffer geometry — the
-    // compositor scales its layer to the view, so a view resize needs nothing
-    // here. The GL renderer draws at the surface size and does need it.
+    // compositor scales its layer to the view, so a resize needs nothing here.
+    // The GL renderer draws at the surface size and does need it.
     if (!player->directSurface && player->surface) {
         player->updateNativeSurface(player->surface, w, h);
     }

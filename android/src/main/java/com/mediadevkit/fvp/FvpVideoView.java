@@ -46,6 +46,10 @@ public class FvpVideoView implements PlatformView, SurfaceHolder.Callback {
     // right before the native attach, which reads it via getenv.
     private final String directMode;
     private boolean released = false;
+    // Last size handed to the native side, so a surfaceChanged that reports the
+    // size we already set (the usual case with setFixedSize) costs nothing.
+    private int surfaceWidth;
+    private int surfaceHeight;
 
     FvpVideoView(Context context, int viewId, Map<String, Object> params) {
         playerHandle = ((Number) params.get("player")).longValue();
@@ -78,17 +82,21 @@ public class FvpVideoView implements PlatformView, SurfaceHolder.Callback {
             Log.w("FvpPlugin", "setenv FVP_DIRECT_SURFACE failed: " + e);
         }
         FvpPlugin.nativeSetSurface(playerHandle, surfaceId, holder.getSurface(), videoWidth, videoHeight, tunnel);
+        surfaceWidth = videoWidth;
+        surfaceHeight = videoHeight;
         released = false;
     }
 
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
         Log.i("FvpPlugin", "FvpVideoView surfaceChanged " + width + "x" + height + " format " + format);
-        if (released) {
+        if (released || (width == surfaceWidth && height == surfaceHeight)) {
             return;
         }
+        surfaceWidth = width;
+        surfaceHeight = height;
         // With setFixedSize (video size known) this is the video resolution and
-        // never changes — the native side de-dupes. Without it the surface
+        // never changes, so the check above skips it. Without it the surface
         // follows the view, and the GL renderer needs the new size.
         FvpPlugin.nativeSetSurfaceSize(surfaceId, width, height);
     }
