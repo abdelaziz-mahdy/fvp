@@ -109,9 +109,18 @@ Java_com_mediadevkit_fvp_FvpPlugin_nativeSetSurface(JNIEnv *env, jobject thiz, j
                 // MediaCodec left bound to a dead surface wedges (dequeue
                 // -10000, "can not return buffer to native window") and MDK
                 // marks the stream as decode-error — the next surface then
-                // never shows a frame. A surface-less re-open releases the
-                // codec cleanly; the re-attach re-opens with the new surface.
-                player->setDecoders(mdk::MediaType::Video, {"AMediaCodec"});
+                // never shows a frame. The re-attach re-opens the decoder with
+                // the new surface.
+                //
+                // An empty decoder list releases the codec without opening a
+                // replacement. Re-opening one here ({"AMediaCodec"}) costs
+                // ~600 ms on the calling thread — and this runs on the Android
+                // UI thread inside SurfaceHolder.Callback.surfaceDestroyed —
+                // because MDK creates+configures+starts a fresh codec and
+                // re-primes the pipeline (measured: 37 skipped frames, the
+                // whole exit animation frozen, on a TCL/Realtek TV with a 30 s
+                // buffer). Nothing can be displayed without a surface anyway.
+                player->setDecoders(mdk::MediaType::Video, {});
             }
             player->updateNativeSurface(nullptr);
             players.erase(it);
@@ -148,6 +157,8 @@ Java_com_mediadevkit_fvp_FvpPlugin_nativeSetSurface(JNIEnv *env, jobject thiz, j
         //   FVP_DIRECT_SURFACE=tunnel -> tunnel=1:window=<ANativeWindow*>,
         //                                true tunneled (sideband) playback per
         //                                the AMediaCodec property docs.
+        // dv=1 is required for Dolby Vision profile 5 straight to a
+        // SurfaceView on SDKs before it became the default.
         player->surface = env->NewGlobalRef(surface);
         player->directSurface = true;
         std::string vd;
@@ -155,7 +166,7 @@ Java_com_mediadevkit_fvp_FvpPlugin_nativeSetSurface(JNIEnv *env, jobject thiz, j
             player->window = ANativeWindow_fromSurface(env, surface);
             vd = "AMediaCodec:image=0:tunnel=1:window=" + std::to_string((intptr_t)player->window);
         } else {
-            vd = "AMediaCodec:image=0:surface=" + std::to_string((intptr_t)player->surface);
+            vd = "AMediaCodec:dv=1:image=0:surface=" + std::to_string((intptr_t)player->surface);
         }
         player->setDecoders(mdk::MediaType::Video, {vd});
     } else {
@@ -164,10 +175,37 @@ Java_com_mediadevkit_fvp_FvpPlugin_nativeSetSurface(JNIEnv *env, jobject thiz, j
             ra.depth = 8;
             player->setRenderAPI(&ra, surface);
         }
-        player->updateNativeSurface(surface, w, h);
-        player->vo_opaque = surface;
+        // Global ref: the surface has to stay valid for later size updates
+        // (surfaceChanged) and for the renderer, which outlives this call.
+        player->surface = env->NewGlobalRef(surface);
+        player->updateNativeSurface(player->surface, w, h);
+        player->vo_opaque = player->surface;
     }
+    player->width = w;
+    player->height = h;
     players[tex_id] = player;
+}
+
+extern "C"
+JNIEXPORT void JNICALL
+Java_com_mediadevkit_fvp_FvpPlugin_nativeSetSurfaceSize(JNIEnv *env, jobject thiz, jlong tex_id,
+                                                        jint w, jint h) {
+    auto it = players.find(tex_id);
+    if (it == players.end()) {
+        return;
+    }
+    auto& player = it->second;
+    if (player->width == w && player->height == h) {
+        return;
+    }
+    player->width = w;
+    player->height = h;
+    // In direct-surface mode the decoder owns the buffer geometry — the
+    // compositor scales its layer to the view, so a view resize needs nothing
+    // here. The GL renderer draws at the surface size and does need it.
+    if (!player->directSurface && player->surface) {
+        player->updateNativeSurface(player->surface, w, h);
+    }
 }
 
 extern "C"

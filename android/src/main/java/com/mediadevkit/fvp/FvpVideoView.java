@@ -83,8 +83,14 @@ public class FvpVideoView implements PlatformView, SurfaceHolder.Callback {
 
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-        // Buffer size is fixed; nothing to do. Logged for diagnostics.
         Log.i("FvpPlugin", "FvpVideoView surfaceChanged " + width + "x" + height + " format " + format);
+        if (released) {
+            return;
+        }
+        // With setFixedSize (video size known) this is the video resolution and
+        // never changes — the native side de-dupes. Without it the surface
+        // follows the view, and the GL renderer needs the new size.
+        FvpPlugin.nativeSetSurfaceSize(surfaceId, width, height);
     }
 
     @Override

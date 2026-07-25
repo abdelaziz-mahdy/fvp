@@ -155,6 +155,12 @@ public class FvpPlugin implements FlutterPlugin, MethodCallHandler {
    */
   static native void nativeSetSurface(long playerHandle, long texId, Surface surface, int w, int h, boolean tunnel);
 
+  /*!
+    Surface size change (SurfaceHolder.Callback.surfaceChanged). No-op in
+    direct-surface mode, where the decoder owns the buffer geometry.
+   */
+  static native void nativeSetSurfaceSize(long texId, int w, int h);
+
   static {
     try {
         System.loadLibrary("mdk");
