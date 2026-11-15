@@ -190,10 +190,22 @@ class Player {
 
     _receivePort.close();
 
-    Libmdk.instance.mdkPlayerAPI_delete(_pp);
-    calloc.free(_pp);
+    if (Platform.isAndroid) {
+      Libfvp.releasePlayerSurfaces(nativeHandle);
+    }
+    // mdkPlayerAPI_delete joins MDK's reader and decoder threads, and a
+    // decoder stuck inside MediaCodec keeps them alive indefinitely (#412).
+    // Dart runs on the platform thread on Android and iOS, so deleting here
+    // froze the app into an ANR. Every callback is unregistered above, so
+    // nothing calls back into this isolate: delete on a helper isolate.
+    final pp = _pp.address;
     _pp = nullptr;
     textureId.dispose();
+    await Isolate.run(() {
+      final p = Pointer<Pointer<mdkPlayerAPI>>.fromAddress(pp);
+      Libmdk.instance.mdkPlayerAPI_delete(p);
+      calloc.free(p);
+    });
   }
 
   /// Release current texture then create a new one for current [media], and update [textureId].
