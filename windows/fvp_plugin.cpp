@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2023 WangBin <wbsecg1 at gmail.com>
+ * Copyright (c) 2023-2026 WangBin <wbsecg1 at gmail.com>
+ * AI participated
  */
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
@@ -99,7 +100,7 @@ private:
 template<typename T>
 auto View_GetGraphicsAdapter(T* v) -> decltype(v->GetGraphicsAdapter())
 {
-    return v->GetGraphicsAdapter();
+    return v ? v->GetGraphicsAdapter() : nullptr;
 }
 
 template<typename T>
@@ -107,17 +108,35 @@ IDXGIAdapter* View_GetGraphicsAdapter(T v) {
     return nullptr;
 }
 
+// Asking the registrar works without an implicit view (headless engine, multi-window apps).
+template<typename T>
+auto Registrar_GetGraphicsAdapter(T* r, int) -> decltype((void)r->GetGraphicsAdapter((IDXGIAdapter**)nullptr), ComPtr<IDXGIAdapter>())
+{
+    ComPtr<IDXGIAdapter> adapter;
+    r->GetGraphicsAdapter(&adapter);
+    return adapter;
+}
+
+template<typename T>
+ComPtr<IDXGIAdapter> Registrar_GetGraphicsAdapter(T* r, long)
+{
+    ComPtr<IDXGIAdapter> adapter;
+// Flutter transfers ownership of the returned reference to the caller.
+    adapter.Attach(View_GetGraphicsAdapter(r->GetView()));
+    return adapter;
+}
+
 // static
 void FvpPlugin::RegisterWithRegistrar(
     flutter::PluginRegistrarWindows *registrar) {
-  IDXGIAdapter *adapter = View_GetGraphicsAdapter(registrar->GetView());
+  ComPtr<IDXGIAdapter> adapter = Registrar_GetGraphicsAdapter(registrar, 0);
   if (!adapter)
-    clog << "FlutterView::GetGraphicsAdapter() is not available, texture may be invisible" << endl;
+    clog << "Flutter graphics adapter is not available, texture may be invisible" << endl;
   auto channel =
       std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
           registrar->messenger(), "fvp",
           &flutter::StandardMethodCodec::GetInstance());
-  auto plugin = std::make_unique<FvpPlugin>(registrar->texture_registrar(), adapter);
+  auto plugin = std::make_unique<FvpPlugin>(registrar->texture_registrar(), adapter.Get());
 
   channel->SetMethodCallHandler(
       [plugin_pointer = plugin.get()](const auto &call, auto result) {

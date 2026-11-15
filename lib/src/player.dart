@@ -199,6 +199,12 @@ class Player {
 
     _receivePort.close();
 
+    if (Platform.isAndroid) {
+      // A platform view's native binding points at this player and is
+      // otherwise only dropped by surfaceDestroyed, which can run after the
+      // delete below and then touch freed memory.
+      Libfvp.releasePlayerSurfaces(nativeHandle);
+    }
     // MediaCodec::stop can block in vendor drivers. Texture and callback
     // teardown must finish here before the worker takes ownership of deletion.
     final address = _pp.address;
